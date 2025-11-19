@@ -9,4 +9,6 @@ matplotlib>=3.7.0
 numpy>=1.24.0
 pandas>=2.0.0
 einops>=0.7.0
-
+gluonts>=0.14.0
+uni2ts>=2.0.0
+openpyxl>=3.1.0

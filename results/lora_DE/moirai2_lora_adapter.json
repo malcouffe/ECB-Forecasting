@@ -1,0 +1,24 @@
+{
+  "batch_size": 8,
+  "best_val_pinball": 4181.224609375,
+  "context_length": 40,
+  "device": "cpu",
+  "epochs": 5,
+  "learning_rate": 0.0005,
+  "lora_alpha": 16.0,
+  "lora_dropout": 0.05,
+  "lora_rank": 8,
+  "lora_targets": [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "out_proj",
+    "fc1",
+    "fc2",
+    "fc_gate"
+  ],
+  "model_name": "Salesforce/moirai-2.0-R-small",
+  "num_windows": 81,
+  "prediction_length": 4,
+  "weight_decay": 0.0
+}
