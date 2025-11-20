@@ -1,0 +1,26 @@
+{
+  "batch_size": 16,
+  "best_val_pinball": 3115.76171875,
+  "context_length": 40,
+  "device": "cpu",
+  "epochs": 23,
+  "filtered_windows_due_to_cutoff": 32,
+  "learning_rate": 0.0002,
+  "lora_alpha": 16.0,
+  "lora_dropout": 0.05,
+  "lora_rank": 8,
+  "lora_targets": [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "out_proj"
+  ],
+  "model_name": "Salesforce/moirai-2.0-R-small",
+  "num_train_windows": 262,
+  "num_val_windows": 30,
+  "num_windows": 292,
+  "prediction_length": 4,
+  "train_cutoff_timestamp": "2023-12-31",
+  "val_ratio": 0.1,
+  "weight_decay": 0.0
+}

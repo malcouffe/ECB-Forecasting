@@ -25,6 +25,7 @@ from typing import Iterable, Sequence
 import sys
 
 import numpy as np
+import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset, Subset
@@ -59,13 +60,21 @@ class SlidingWindowDataset(Dataset):
         stride: int,
         id_column: str,
         target_column: str,
+        timestamp_column: str,
         allowed_series_ids: set[str] | None = None,
+        train_cutoff_timestamp: pd.Timestamp | None = None,
     ):
         if context_length <= 0 or prediction_length <= 0:
             raise ValueError("Context length and prediction length must be > 0.")
         self.context_length = context_length
         self.prediction_length = prediction_length
+        self.train_cutoff_timestamp = (
+            np.datetime64(train_cutoff_timestamp)
+            if train_cutoff_timestamp is not None
+            else None
+        )
         self.windows: list[Window] = []
+        self.filtered_due_to_cutoff = 0
         self._build_windows(
             dataframe,
             context_length,
@@ -73,6 +82,7 @@ class SlidingWindowDataset(Dataset):
             stride,
             id_column,
             target_column,
+            timestamp_column,
             allowed_series_ids,
         )
 
@@ -84,6 +94,7 @@ class SlidingWindowDataset(Dataset):
         stride: int,
         id_column: str,
         target_column: str,
+        timestamp_column: str,
         allowed_series_ids: set[str] | None,
     ) -> None:
         stride = max(1, stride)
@@ -92,7 +103,9 @@ class SlidingWindowDataset(Dataset):
             normalized_id = str(series_id)
             if allowed_series_ids and normalized_id not in allowed_series_ids:
                 continue
-            values = group.sort_values("timestamp")[target_column].to_numpy(dtype=np.float32)
+            sorted_group = group.sort_values(timestamp_column)
+            timestamps = sorted_group[timestamp_column].to_numpy(dtype="datetime64[ns]")
+            values = sorted_group[target_column].to_numpy(dtype=np.float32)
             observed = ~np.isnan(values)
             if len(values) < context_length + prediction_length:
                 continue
@@ -101,6 +114,11 @@ class SlidingWindowDataset(Dataset):
             for start in range(
                 0, len(values) - context_length - prediction_length + 1, stride
             ):
+                if self.train_cutoff_timestamp is not None:
+                    max_timestamp = timestamps[start + context_length + prediction_length - 1]
+                    if max_timestamp >= self.train_cutoff_timestamp:
+                        self.filtered_due_to_cutoff += 1
+                        continue
                 ctx = imputed[start : start + context_length]
                 ctx_obs = observed[start : start + context_length]
                 fut = imputed[start + context_length : start + context_length + prediction_length]
@@ -229,18 +247,26 @@ def split_dataset(
     dataset: Dataset,
     val_ratio: float,
     seed: int,
-) -> tuple[Subset, Subset]:
+) -> tuple[Subset, Subset, dict[str, list[int]]]:
     if not 0.0 < val_ratio < 1.0:
         raise ValueError("Validation ratio must be between 0 and 1.")
     num_items = len(dataset)
     indices = list(range(num_items))
     random.Random(seed).shuffle(indices)
-    split = int(num_items * (1 - val_ratio))
-    train_indices = indices[:split]
-    val_indices = indices[split:]
+    train_cutoff = int(num_items * (1 - val_ratio))
+    train_indices = indices[:train_cutoff]
+    val_indices = indices[train_cutoff:]
     if not train_indices or not val_indices:
         raise RuntimeError("Not enough samples to perform the requested split.")
-    return Subset(dataset, train_indices), Subset(dataset, val_indices)
+    splits = {
+        "train": train_indices,
+        "val": val_indices,
+    }
+    return (
+        Subset(dataset, train_indices),
+        Subset(dataset, val_indices),
+        splits,
+    )
 
 
 def create_dataloaders(
@@ -248,8 +274,8 @@ def create_dataloaders(
     batch_size: int,
     val_ratio: float,
     seed: int,
-) -> tuple[DataLoader, DataLoader]:
-    train_set, val_set = split_dataset(dataset, val_ratio, seed)
+) -> tuple[DataLoader, DataLoader, dict[str, list[int]]]:
+    train_set, val_set, splits = split_dataset(dataset, val_ratio, seed)
     train_loader = DataLoader(
         train_set,
         batch_size=batch_size,
@@ -262,7 +288,7 @@ def create_dataloaders(
         shuffle=False,
         drop_last=False,
     )
-    return train_loader, val_loader
+    return train_loader, val_loader, splits
 
 
 def save_lora_weights(
@@ -355,6 +381,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Sliding window stride when generating training samples.",
     )
     parser.add_argument(
+        "--train-cutoff-timestamp",
+        type=str,
+        default="2023-12-31",
+        help=(
+            "Drop any sliding window whose timestamps extend to or beyond this cutoff before "
+            "constructing the train/val splits. Use ISO format such as '2023-12-31'."
+        ),
+    )
+    parser.add_argument(
         "--batch-size",
         type=int,
         default=16,
@@ -429,8 +464,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--lora-targets",
         type=str,
-        default="q_proj,k_proj,v_proj,out_proj,fc1,fc2,fc_gate",
-        help="Comma-separated list of module suffixes to wrap with LoRA adapters.",
+        default="q_proj,k_proj,v_proj,out_proj",
+        help=(
+            "Comma-separated list of module suffixes to wrap with LoRA adapters. "
+            "Defaults to attention projections only to avoid modifying the MLP block."
+        ),
     )
     return parser.parse_args(argv)
 
@@ -472,6 +510,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"{len(summary.series_ids)} countries ({summary.start.date()} -> {summary.end.date()})."
     )
     allowed_ids = set(args.series_id) if args.series_id else None
+    cutoff_timestamp = None
+    if args.train_cutoff_timestamp:
+        try:
+            cutoff_timestamp = pd.Timestamp(args.train_cutoff_timestamp)
+        except Exception as exc:  # pragma: no cover - defensive conversion
+            raise SystemExit(
+                f"Failed to parse --train-cutoff-timestamp='{args.train_cutoff_timestamp}': {exc}"
+            )
 
     dataset = SlidingWindowDataset(
         dataframe=dataframe,
@@ -480,13 +526,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         stride=args.stride,
         id_column="country",
         target_column="investment",
+        timestamp_column="timestamp",
         allowed_series_ids=allowed_ids,
+        train_cutoff_timestamp=cutoff_timestamp,
     )
     if len(dataset) == 0:
         raise RuntimeError("No training windows were generated. Adjust the hyper-parameters.")
     print(f"Prepared {len(dataset)} windows ({args.context_length}+{args.prediction_length}).")
+    if dataset.filtered_due_to_cutoff:
+        print(
+            "Filtered "
+            f"{dataset.filtered_due_to_cutoff} windows with timestamps >= {cutoff_timestamp.date()}"
+        )
 
-    train_loader, val_loader = create_dataloaders(
+    train_loader, val_loader, split_indices = create_dataloaders(
         dataset,
         batch_size=args.batch_size,
         val_ratio=args.val_ratio,
@@ -532,7 +585,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         val_loss = run_epoch(val_loader, forecast, quantiles, device, optimizer=None)
         print(f"Epoch {epoch:02d} | Train pinball loss: {train_loss:.4f} | Val pinball loss: {val_loss:.4f}")
         best_val = min(best_val, val_loss)
-
     metadata = {
         "model_name": args.model_name,
         "context_length": args.context_length,
@@ -548,6 +600,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "device": device_str,
         "best_val_pinball": best_val,
         "num_windows": len(dataset),
+        "val_ratio": args.val_ratio,
+        "num_train_windows": len(split_indices["train"]),
+        "num_val_windows": len(split_indices["val"]),
+        "train_cutoff_timestamp": args.train_cutoff_timestamp,
+        "filtered_windows_due_to_cutoff": dataset.filtered_due_to_cutoff,
     }
     artifact_path = save_lora_weights(module, args.output_dir, metadata)
     print(f"Saved LoRA adapter to {artifact_path}")

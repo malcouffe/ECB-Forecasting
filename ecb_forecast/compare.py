@@ -90,16 +90,19 @@ class Chronos2Runner:
         id_column: str,
         timestamp_column: str,
         target_column: str,
+        future_df: pd.DataFrame | None = None,
     ) -> ForecastResult:
         start = time.perf_counter()
-        pred_df = self.pipeline.predict_df(
-            context_df,
-            prediction_length=prediction_length,
-            quantile_levels=list(quantile_levels),
-            id_column=id_column,
-            timestamp_column=timestamp_column,
-            target=target_column,
-        )
+        predict_kwargs = {
+            "prediction_length": prediction_length,
+            "quantile_levels": list(quantile_levels),
+            "id_column": id_column,
+            "timestamp_column": timestamp_column,
+            "target": target_column,
+        }
+        if future_df is not None:
+            predict_kwargs["future_df"] = future_df
+        pred_df = self.pipeline.predict_df(context_df, **predict_kwargs)
         elapsed = time.perf_counter() - start
         subset = pred_df[pred_df[id_column] == context_df[id_column].iloc[0]].copy()
         rename_map = {}
